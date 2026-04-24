@@ -9,7 +9,7 @@ Automatic syringe pump sequence:
 
 MAYBE DO RAMP + FAST BURST
 --start slow the increase speed to max 
-ADD DELAYS ONCE WE FIGURE IT OUT
+ADD DELAYS ONCE WE FIGURE IT OUT --> ADD TO MAIN CODE
 
 Notes:
 - "PULL" = intake

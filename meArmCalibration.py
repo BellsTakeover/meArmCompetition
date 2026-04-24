@@ -9,7 +9,7 @@ Purpose:
 
 Important note:
 - This script calibrates in x/y/z bucket positions, not raw base/elbow/wrist angles --> let's see if it works
-- That matches the earlier meArm code style that uses (Zero.py):
+- That matches the earlier meArm code style that uses (Zero.py): --> let's see if it was best choice
     arm.move_to(x, y, z)
     arm.get_position()
 
@@ -59,9 +59,7 @@ from typing import Dict, List, Tuple
 import pygame
 import meArm
 
-# -----------------------------------------------------------------------------
-# Constants
-# -----------------------------------------------------------------------------
+# Basic settings used throughout the program
 DEFAULT_ADDRESS = 0x6F
 POINTS_FILE = "mearm_transfer_points.json"
 LOG_FILE = "mearm_move_log.csv"
@@ -74,14 +72,12 @@ DEFAULT_STEP_MM = 5.0
 MIN_STEP_MM = 1.0
 MAX_STEP_MM = 20.0
 
-# -----------------------------------------------------------------------------
-# Thonny-friendly settings
-# -----------------------------------------------------------------------------
-# If you press Run in Thonny without command-line arguments, these values are used.
-# Each teammate should only need to change THONNY_ARM_ID.
-ARM_ID = "arm1"          #change to: "arm1", "arm2", or "arm3"
-MODE = "calibrate"       #"calibrate" or "run"
-CYCLES = 3                #used only in run mode
+# Settings to make the script easier to run from Thonny
+# These defaults are used when you press Run in Thonny without command-line arguments.
+# Each teammate should usually only need to change ARM_ID.
+ARM_ID = "arm1"          # change to "arm1", "arm2", or "arm3"
+MODE = "calibrate"       # use "calibrate" to save points or "run" to start the automatic cycle
+CYCLES = 3                # used only in run mode
 ADDRESS = DEFAULT_ADDRESS
 POINTS_FILE = POINTS_FILE
 LOG_FILE = LOG_FILE
@@ -92,7 +88,7 @@ ARM_TASKS = {
     "arm3": "bucket 3 -> bucket 4",
 }
 
-# Starter-safe workspaces. Tune these after testing.
+# Starter-safe movement limits for each arm. Adjust these after testing the real setup.
 ARM_WORKSPACES: Dict[str, Dict[str, float]] = {
     "arm1": {"x_min": -130.0, "x_max": -10.0, "y_min": 85.0, "y_max": 210.0, "z_min": 35.0, "z_max": 125.0},
     "arm2": {"x_min":  -55.0, "x_max":  55.0, "y_min": 85.0, "y_max": 210.0, "z_min": 35.0, "z_max": 125.0},
@@ -102,9 +98,7 @@ ARM_WORKSPACES: Dict[str, Dict[str, float]] = {
 POSE_NAMES = ["rest", "intake", "outtake"]
 
 
-# -----------------------------------------------------------------------------
-# Data helpers
-# -----------------------------------------------------------------------------
+# Small helpers for storing and checking arm positions
 @dataclass
 class Pose:
     x: float
@@ -196,9 +190,7 @@ class TimedMeArm:
         }
 
 
-# -----------------------------------------------------------------------------
-# Config storage
-# -----------------------------------------------------------------------------
+# Save and load the rest, intake, and outtake positions
 def default_points() -> Dict[str, Dict[str, Dict[str, float]]]:
     return {
         "arm1": {
@@ -235,9 +227,7 @@ def save_points(data: Dict[str, Dict[str, Dict[str, float]]], path: str = POINTS
         json.dump(data, f, indent=4)
 
 
-# -----------------------------------------------------------------------------
-# Logging helpers
-# -----------------------------------------------------------------------------
+# Timing log helpers
 def append_move_log(row: Dict[str, object], path: str = LOG_FILE) -> None:
     file_exists = os.path.exists(path)
     fieldnames = [
@@ -268,9 +258,7 @@ def log_move_event(controller: TimedMeArm, info: Dict[str, float], cycle: int, s
     append_move_log(row, path)
 
 
-# -----------------------------------------------------------------------------
-# Pygame calibration UI
-# -----------------------------------------------------------------------------
+# Pygame screen used for keyboard calibration --> chatgpt code
 def draw_text(
     screen,
     font,
@@ -390,8 +378,8 @@ def calibration_mode(controller: TimedMeArm, points_path: str, log_path: str) ->
             moved = False
             new_pose = Pose(edit_pose.x, edit_pose.y, edit_pose.z)
 
-            # Keep the same motion style as the earlier controller:
-            # up/down affect y, right/left affect x, w/s affect z.
+            # Keep the same control style as the earlier version.
+            # Arrow keys move X/Y, and W/S moves Z.
             if keys[pygame.K_UP]:
                 new_pose.y += step_mm
                 moved = True
@@ -441,9 +429,7 @@ def calibration_mode(controller: TimedMeArm, points_path: str, log_path: str) ->
     pygame.quit()
 
 
-# -----------------------------------------------------------------------------
-# Automatic run mode
-# -----------------------------------------------------------------------------
+# Automatic movement loop after the points have been calibrated
 def run_mode(controller: TimedMeArm, points_path: str, cycles: int, log_path: str) -> None:
     points = load_points(points_path)
     arm_points = points[controller.arm_id]
@@ -491,9 +477,7 @@ def run_mode(controller: TimedMeArm, points_path: str, cycles: int, log_path: st
     print(f"\nSaved timing log to {log_path}\n")
 
 
-# -----------------------------------------------------------------------------
-# CLI
-# -----------------------------------------------------------------------------
+# Command-line setup
 def setup_logging() -> None:
     logging.basicConfig(
         level=logging.INFO,
