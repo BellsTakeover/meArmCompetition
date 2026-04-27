@@ -8,7 +8,8 @@ Purpose:
 - Then the same file can run the arm automatically and log motion timing
 
 Important note:
-- This script calibrates in x/y/z bucket positions, not raw base/elbow/wrist angles --> let's see if it works
+- This script calibrates in x/y/z bucket positions, not raw base/elbow/wrist angles --> let's see if it 
+    -- Didn;t work so moved to raw base/elbow/wrist angles
 - That matches the earlier meArm code style that uses (Zero.py): --> let's see if it was best choice
     arm.move_to(x, y, z)
     arm.get_position()
@@ -19,17 +20,16 @@ ARM roles:
 - arm3 : bucket 3 -> bucket 4
 
 Calibration controls:
-- Arrow keys: move in X/Y
-- W / S: move in Z
-- [: decrease step size
-- ]: increase step size
-- 1: edit rest point
-- 2: edit intake point
-- 3: edit outtake point
-- ENTER: save current point
-- SPACE: move to the currently selected saved point
-- H: move to rest point
-- Q or ESC: save and quit
+- Up / Down: base + / -
+- Right / Left : shoulder + / -
+- A / S: elbow + / -
+- [ / ]: decrease / increase step size
+- 1 / 2 / 3: select REST / INTAKE / OUTTAKE
+- Enter save current angles to selected point
+- Space: move to selected saved point and log timing
+- H : move to REST point and log timing
+- T : run timing test REST -> INTAKE -> OUTTAKE -> REST
+- Q or ESC : save and quit
 
 Files created:
 - mearm_transfer_points.json : saved coordinates for all 3 arms
@@ -40,173 +40,111 @@ User guide (Megan + Wayne):
 2. Leave MODE = "calibrate" and press Run to save the 3 positions
 3. Change MODE = "run" and change CYCLES = 5, then press Run again.
 4. Send to Isabella (copy and paste into an email works just make sure to ):
-   - mearm_transfer_points.json
-   - mearm_move_log.csv
+   - mearm_joint_points.json
+   - mearm_joint_move_log.csv
 """
 
-import argparse
 import csv
 import json
-import logging
-import math
 import os
-import signal
-import sys
 import time
 from dataclasses import dataclass, asdict
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
+import board
 import pygame
-import meArm
+from adafruit_motor import servo
+from adafruit_pca9685 import PCA9685
 
-# Basic settings used throughout the program
-DEFAULT_ADDRESS = 0x6F
-POINTS_FILE = "mearm_transfer_points.json"
-LOG_FILE = "mearm_move_log.csv"
-POSITION_TOL_MM = 4.0
-MOVE_TIMEOUT_S = 4.0
-MOVE_SETTLE_S = 0.25
-KEY_INTERVAL_S = 0.03
-WINDOW_SIZE = (780, 520)
-DEFAULT_STEP_MM = 5.0
-MIN_STEP_MM = 1.0
-MAX_STEP_MM = 20.0
+# -----------------------------
+# Thonny-friendly settings
+# -----------------------------
+ARM_ID = "arm1"   # change to: arm1, arm2, arm3
+PWM_ADDRESS = 0x60
+POINTS_FILE = "mearm_joint_points.json"
+LOG_FILE = "mearm_joint_move_log.csv"
+WINDOW_SIZE = (780, 540)
+DEFAULT_STEP_DEG = 2.0
+MIN_STEP_DEG = 0.5
+MAX_STEP_DEG = 10.0
+KEY_INTERVAL_S = 0.06
+MOVE_SETTLE_S = 0.18
+PREVIEW_SETTLE_S = 0.04
+TIMING_TEST_CYCLES = 3
 
-# Settings to make the script easier to run from Thonny
-# These defaults are used when you press Run in Thonny without command-line arguments.
-# Each teammate should usually only need to change ARM_ID.
-ARM_ID = "arm1"          # change to "arm1", "arm2", or "arm3"
-MODE = "calibrate"       # use "calibrate" to save points or "run" to start the automatic cycle
-CYCLES = 3                # used only in run mode
-ADDRESS = DEFAULT_ADDRESS
-POINTS_FILE = POINTS_FILE
-LOG_FILE = LOG_FILE
-
-ARM_TASKS = {
-    "arm1": "bucket 1 -> bucket 2",
-    "arm2": "bucket 2 -> bucket 3",
-    "arm3": "bucket 3 -> bucket 4",
+# Servo channels used by the meArm files shared in this conversation.
+CHANNELS = {
+    "base": 0,
+    "shoulder": 1,
+    "elbow": 14,
 }
 
-# Starter-safe movement limits for each arm. Adjust these after testing the real setup.
-ARM_WORKSPACES: Dict[str, Dict[str, float]] = {
-    "arm1": {"x_min": -130.0, "x_max": -10.0, "y_min": 85.0, "y_max": 210.0, "z_min": 35.0, "z_max": 125.0},
-    "arm2": {"x_min":  -55.0, "x_max":  55.0, "y_min": 85.0, "y_max": 210.0, "z_min": 35.0, "z_max": 125.0},
-    "arm3": {"x_min":   10.0, "x_max": 130.0, "y_min": 85.0, "y_max": 210.0, "z_min": 35.0, "z_max": 125.0},
+# These limits are intentionally conservative and can be edited later.
+JOINT_LIMITS = {
+    "base": {"min": 10.0, "max": 170.0},
+    "shoulder": {"min": 20.0, "max": 160.0},
+    "elbow": {"min": 10.0, "max": 170.0},
 }
 
 POSE_NAMES = ["rest", "intake", "outtake"]
 
 
-# Small helpers for storing and checking arm positions
 @dataclass
-class Pose:
-    x: float
-    y: float
-    z: float
-
-    def as_tuple(self) -> Tuple[float, float, float]:
-        return (self.x, self.y, self.z)
-
+class JointPose:
+    base: float
+    shoulder: float
+    elbow: float
 
 
 def clamp(value: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, value))
 
 
-class TimedMeArm:
-    def __init__(self, arm_id: str, address: int = DEFAULT_ADDRESS):
-        if arm_id not in ARM_WORKSPACES:
-            raise ValueError(f"Unknown arm_id {arm_id}. Choose from {list(ARM_WORKSPACES)}")
-
-        self.arm_id = arm_id
-        self.workspace = ARM_WORKSPACES[arm_id]
-        self.logger = logging.getLogger(arm_id)
-        self.logger.setLevel(logging.INFO)
-        self.arm = meArm.meArm(logger=self.logger)
-
-    def current_pose(self) -> Pose:
-        x, y, z = self.arm.get_position()
-        return Pose(float(x), float(y), float(z))
-
-    def clip_pose(self, pose: Pose) -> Pose:
-        return Pose(
-            x=clamp(pose.x, self.workspace["x_min"], self.workspace["x_max"]),
-            y=clamp(pose.y, self.workspace["y_min"], self.workspace["y_max"]),
-            z=clamp(pose.z, self.workspace["z_min"], self.workspace["z_max"]),
-        )
-
-    def radial_ok(self, pose: Pose, r_min: float = 75.0, r_max: float = 225.0) -> bool:
-        r = math.sqrt(pose.x**2 + pose.y**2)
-        return r_min <= r <= r_max
-
-    def validate_pose(self, pose: Pose) -> Pose:
-        pose = self.clip_pose(pose)
-        if not self.radial_ok(pose):
-            raise ValueError(
-                f"Pose {pose} failed coarse reach check. "
-                f"Adjust the bucket placement or workspace for {self.arm_id}."
-            )
-        return pose
-
-    def at_pose(self, target: Pose, tol_mm: float = POSITION_TOL_MM) -> bool:
-        now = self.current_pose()
-        return (
-            abs(now.x - target.x) <= tol_mm and
-            abs(now.y - target.y) <= tol_mm and
-            abs(now.z - target.z) <= tol_mm
-        )
-
-    def move_to(self, target: Pose, settle_s: float = MOVE_SETTLE_S) -> Dict[str, float]:
-        safe_target = self.validate_pose(target)
-        start_pose = self.current_pose()
-        t0 = time.time()
-
-        self.arm.move_to(safe_target.x, safe_target.y, safe_target.z)
-
-        reached = False
-        while time.time() - t0 < MOVE_TIMEOUT_S:
-            if self.at_pose(safe_target):
-                reached = True
-                break
-            time.sleep(0.02)
-
-        time.sleep(settle_s)
-        t1 = time.time()
-        end_pose = self.current_pose()
-
-        return {
-            "elapsed_s": round(t1 - t0, 4),
-            "reached": int(reached),
-            "start_x": round(start_pose.x, 2),
-            "start_y": round(start_pose.y, 2),
-            "start_z": round(start_pose.z, 2),
-            "target_x": round(safe_target.x, 2),
-            "target_y": round(safe_target.y, 2),
-            "target_z": round(safe_target.z, 2),
-            "end_x": round(end_pose.x, 2),
-            "end_y": round(end_pose.y, 2),
-            "end_z": round(end_pose.z, 2),
+class JointCalibrator:
+    def __init__(self, pwm_address: int = PWM_ADDRESS):
+        self.i2c = board.I2C()
+        self.pca = PCA9685(self.i2c, address=pwm_address, reference_clock_speed=25_000_000)
+        self.pca.frequency = 50
+        self.servos = {
+            name: servo.Servo(self.pca.channels[ch], min_pulse=500, max_pulse=2500)
+            for name, ch in CHANNELS.items()
         }
+        self.last_pose: JointPose | None = None
+
+    def release(self) -> None:
+        try:
+            self.pca.deinit()
+        except Exception:
+            pass
+
+    def apply_pose(self, pose: JointPose, settle_s: float = MOVE_SETTLE_S) -> float:
+        clipped = clip_pose(pose)
+        t0 = time.perf_counter()
+        self.servos["base"].angle = clipped.base
+        self.servos["shoulder"].angle = clipped.shoulder
+        self.servos["elbow"].angle = clipped.elbow
+        time.sleep(settle_s)
+        self.last_pose = clipped
+        return time.perf_counter() - t0
 
 
-# Save and load the rest, intake, and outtake positions
+
 def default_points() -> Dict[str, Dict[str, Dict[str, float]]]:
     return {
         "arm1": {
-            "rest": {"x": -55.0, "y": 120.0, "z": 85.0},
-            "intake": {"x": -85.0, "y": 165.0, "z": 55.0},
-            "outtake": {"x": -30.0, "y": 185.0, "z": 55.0},
+            "rest": {"base": 90.0, "shoulder": 95.0, "elbow": 90.0},
+            "intake": {"base": 75.0, "shoulder": 110.0, "elbow": 95.0},
+            "outtake": {"base": 105.0, "shoulder": 110.0, "elbow": 95.0},
         },
         "arm2": {
-            "rest": {"x": 0.0, "y": 120.0, "z": 85.0},
-            "intake": {"x": -10.0, "y": 165.0, "z": 55.0},
-            "outtake": {"x": 10.0, "y": 185.0, "z": 55.0},
+            "rest": {"base": 90.0, "shoulder": 95.0, "elbow": 90.0},
+            "intake": {"base": 82.0, "shoulder": 110.0, "elbow": 95.0},
+            "outtake": {"base": 98.0, "shoulder": 110.0, "elbow": 95.0},
         },
         "arm3": {
-            "rest": {"x": 55.0, "y": 120.0, "z": 85.0},
-            "intake": {"x": 30.0, "y": 165.0, "z": 55.0},
-            "outtake": {"x": 85.0, "y": 185.0, "z": 55.0},
+            "rest": {"base": 90.0, "shoulder": 95.0, "elbow": 90.0},
+            "intake": {"base": 105.0, "shoulder": 110.0, "elbow": 95.0},
+            "outtake": {"base": 75.0, "shoulder": 110.0, "elbow": 95.0},
         },
     }
 
@@ -227,15 +165,36 @@ def save_points(data: Dict[str, Dict[str, Dict[str, float]]], path: str = POINTS
         json.dump(data, f, indent=4)
 
 
-# Timing log helpers
+
+def as_pose(d: Dict[str, float]) -> JointPose:
+    return JointPose(base=float(d["base"]), shoulder=float(d["shoulder"]), elbow=float(d["elbow"]))
+
+
+
+def clip_pose(pose: JointPose) -> JointPose:
+    return JointPose(
+        base=clamp(pose.base, JOINT_LIMITS["base"]["min"], JOINT_LIMITS["base"]["max"]),
+        shoulder=clamp(pose.shoulder, JOINT_LIMITS["shoulder"]["min"], JOINT_LIMITS["shoulder"]["max"]),
+        elbow=clamp(pose.elbow, JOINT_LIMITS["elbow"]["min"], JOINT_LIMITS["elbow"]["max"]),
+    )
+
+
+
 def append_move_log(row: Dict[str, object], path: str = LOG_FILE) -> None:
     file_exists = os.path.exists(path)
     fieldnames = [
-        "timestamp", "arm_id", "task", "cycle", "segment",
-        "elapsed_s", "reached",
-        "start_x", "start_y", "start_z",
-        "target_x", "target_y", "target_z",
-        "end_x", "end_y", "end_z",
+        "timestamp",
+        "arm_id",
+        "event",
+        "cycle",
+        "segment",
+        "elapsed_s",
+        "start_base",
+        "start_shoulder",
+        "start_elbow",
+        "end_base",
+        "end_shoulder",
+        "end_elbow",
     ]
 
     with open(path, "a", newline="", encoding="utf-8") as f:
@@ -246,318 +205,232 @@ def append_move_log(row: Dict[str, object], path: str = LOG_FILE) -> None:
 
 
 
-def log_move_event(controller: TimedMeArm, info: Dict[str, float], cycle: int, segment: str, path: str = LOG_FILE) -> None:
-    row = {
-        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "arm_id": controller.arm_id,
-        "task": ARM_TASKS[controller.arm_id],
-        "cycle": cycle,
-        "segment": segment,
-        **info,
-    }
-    append_move_log(row, path)
+def log_joint_move(event: str, cycle: int, segment: str, start_pose: JointPose, end_pose: JointPose, elapsed_s: float,
+                   path: str = LOG_FILE) -> None:
+    append_move_log(
+        {
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "arm_id": ARM_ID,
+            "event": event,
+            "cycle": cycle,
+            "segment": segment,
+            "elapsed_s": round(elapsed_s, 4),
+            "start_base": round(start_pose.base, 2),
+            "start_shoulder": round(start_pose.shoulder, 2),
+            "start_elbow": round(start_pose.elbow, 2),
+            "end_base": round(end_pose.base, 2),
+            "end_shoulder": round(end_pose.shoulder, 2),
+            "end_elbow": round(end_pose.elbow, 2),
+        },
+        path,
+    )
 
 
-# Pygame screen used for keyboard calibration --> chatgpt code
-def draw_text(
-    screen,
-    font,
-    small_font,
-    arm_id: str,
-    task: str,
-    pose_name: str,
-    edit_pose: Pose,
-    current_pose: Pose,
-    saved_points: Dict[str, Dict[str, float]],
-    step_mm: float,
-    status: str,
-) -> None:
+
+def draw_text(screen, font, small_font, selected_name, edit_pose, saved, step_deg, status, timing_lines):
     screen.fill((245, 245, 245))
-
     lines = [
-        f"ARM: {arm_id}   TASK: {task}",
-        f"Currently editing: {pose_name.upper()}",
-        f"Live commanded pose   X={edit_pose.x:6.1f}  Y={edit_pose.y:6.1f}  Z={edit_pose.z:6.1f}",
-        f"Arm reported pose     X={current_pose.x:6.1f}  Y={current_pose.y:6.1f}  Z={current_pose.z:6.1f}",
-        f"Step size: {step_mm:.1f} mm",
+        f"ARM: {ARM_ID}",
+        f"Currently editing: {selected_name.upper()}",
+        f"Live pose        base={edit_pose.base:6.1f}  shoulder={edit_pose.shoulder:6.1f}  elbow={edit_pose.elbow:6.1f}",
+        f"Step size: {step_deg:.1f} degrees",
         "",
         "Controls:",
-        "Arrow keys = X/Y like your earlier controller",
-        "W / S = Z up / down",
-        "1 = edit REST, 2 = edit INTAKE, 3 = edit OUTTAKE",
-        "ENTER = save the current pose for this point",
-        "SPACE = move arm to the saved pose currently selected",
-        "[ = decrease step size, ] = increase step size",
-        "H = move to REST pose, Q or ESC = save and quit",
+        "Up / Down = base + / -",
+        "Right / Left = shoulder + / -",
+        "A / S = elbow + / -",
+        "1 = REST, 2 = INTAKE, 3 = OUTTAKE",
+        "Enter = save current angles",
+        "Space = move to selected saved point",
+        "H = move to REST, T = timing test, [ / ] = step size, Q or ESC = save and quit",
         "",
-        f"REST    : X={saved_points['rest']['x']:6.1f}  Y={saved_points['rest']['y']:6.1f}  Z={saved_points['rest']['z']:6.1f}",
-        f"INTAKE  : X={saved_points['intake']['x']:6.1f}  Y={saved_points['intake']['y']:6.1f}  Z={saved_points['intake']['z']:6.1f}",
-        f"OUTTAKE : X={saved_points['outtake']['x']:6.1f}  Y={saved_points['outtake']['y']:6.1f}  Z={saved_points['outtake']['z']:6.1f}",
+        f"REST    : base={saved['rest']['base']:6.1f}  shoulder={saved['rest']['shoulder']:6.1f}  elbow={saved['rest']['elbow']:6.1f}",
+        f"INTAKE  : base={saved['intake']['base']:6.1f}  shoulder={saved['intake']['shoulder']:6.1f}  elbow={saved['intake']['elbow']:6.1f}",
+        f"OUTTAKE : base={saved['outtake']['base']:6.1f}  shoulder={saved['outtake']['shoulder']:6.1f}  elbow={saved['outtake']['elbow']:6.1f}",
         "",
         f"Status: {status}",
+        "",
+        "Recent timing:",
     ]
+    lines.extend(timing_lines)
 
     y = 15
     for i, line in enumerate(lines):
-        text = font.render(line, True, (0, 0, 0)) if i < 5 else small_font.render(line, True, (20, 20, 20))
+        text = font.render(line, True, (0, 0, 0)) if i < 4 else small_font.render(line, True, (20, 20, 20))
         screen.blit(text, (15, y))
-        y += 28 if i < 5 else 23
-
+        y += 30 if i < 4 else 24
     pygame.display.flip()
 
 
 
-def calibration_mode(controller: TimedMeArm, points_path: str, log_path: str) -> None:
-    points = load_points(points_path)
-    saved = points[controller.arm_id]
+def format_timing_lines(summary: Dict[str, List[float]]) -> List[str]:
+    if not summary:
+        return ["No timing runs yet. Press SPACE, H, or T to log motion times."]
 
-    pygame.init()
-    screen = pygame.display.set_mode(WINDOW_SIZE)
-    pygame.display.set_caption(f"meArm Calibration - {controller.arm_id}")
-    clock = pygame.time.Clock()
-    font = pygame.font.SysFont(None, 30)
-    small_font = pygame.font.SysFont(None, 24)
-
-    current_edit_name = "rest"
-    current_pose = controller.current_pose()
-    edit_pose = controller.clip_pose(current_pose)
-    step_mm = DEFAULT_STEP_MM
-    status = "Use the keys to move the arm, then ENTER to save each point."
-    last_key_time = 0.0
-    running = True
-
-    while running:
-        now = time.time()
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                running = False
-            elif event.type == pygame.KEYDOWN:
-                if event.key in (pygame.K_ESCAPE, pygame.K_q):
-                    running = False
-                elif event.key == pygame.K_1:
-                    current_edit_name = "rest"
-                    edit_pose = Pose(**saved["rest"])
-                    status = "Editing REST"
-                elif event.key == pygame.K_2:
-                    current_edit_name = "intake"
-                    edit_pose = Pose(**saved["intake"])
-                    status = "Editing INTAKE"
-                elif event.key == pygame.K_3:
-                    current_edit_name = "outtake"
-                    edit_pose = Pose(**saved["outtake"])
-                    status = "Editing OUTTAKE"
-                elif event.key == pygame.K_RETURN:
-                    safe_pose = controller.validate_pose(edit_pose)
-                    saved[current_edit_name] = asdict(safe_pose)
-                    save_points(points, points_path)
-                    status = f"Saved {current_edit_name.upper()}"
-                elif event.key == pygame.K_SPACE:
-                    safe_pose = controller.validate_pose(Pose(**saved[current_edit_name]))
-                    info = controller.move_to(safe_pose)
-                    log_move_event(controller, info, cycle=0, segment=f"calibration_to_{current_edit_name}", path=log_path)
-                    status = (
-                        f"Moved to saved {current_edit_name.upper()} | "
-                        f"time={info['elapsed_s']:.3f}s reached={int(info['reached'])}"
-                    )
-                    edit_pose = safe_pose
-                elif event.key == pygame.K_h:
-                    safe_pose = controller.validate_pose(Pose(**saved["rest"]))
-                    info = controller.move_to(safe_pose)
-                    log_move_event(controller, info, cycle=0, segment="calibration_home_rest", path=log_path)
-                    status = f"Moved HOME/REST | time={info['elapsed_s']:.3f}s reached={int(info['reached'])}"
-                    edit_pose = safe_pose
-                elif event.key == pygame.K_LEFTBRACKET:
-                    step_mm = max(MIN_STEP_MM, step_mm - 1.0)
-                    status = f"Step size = {step_mm:.1f} mm"
-                elif event.key == pygame.K_RIGHTBRACKET:
-                    step_mm = min(MAX_STEP_MM, step_mm + 1.0)
-                    status = f"Step size = {step_mm:.1f} mm"
-
-        if now - last_key_time >= KEY_INTERVAL_S:
-            keys = pygame.key.get_pressed()
-            moved = False
-            new_pose = Pose(edit_pose.x, edit_pose.y, edit_pose.z)
-
-            # Keep the same control style as the earlier version.
-            # Arrow keys move X/Y, and W/S moves Z.
-            if keys[pygame.K_UP]:
-                new_pose.y += step_mm
-                moved = True
-            elif keys[pygame.K_DOWN]:
-                new_pose.y -= step_mm
-                moved = True
-            elif keys[pygame.K_RIGHT]:
-                new_pose.x += step_mm
-                moved = True
-            elif keys[pygame.K_LEFT]:
-                new_pose.x -= step_mm
-                moved = True
-            elif keys[pygame.K_w]:
-                new_pose.z += step_mm
-                moved = True
-            elif keys[pygame.K_s]:
-                new_pose.z -= step_mm
-                moved = True
-
-            if moved:
-                try:
-                    new_pose = controller.validate_pose(new_pose)
-                    controller.move_to(new_pose, settle_s=0.02)
-                    edit_pose = new_pose
-                    status = f"Moved {current_edit_name.upper()} preview"
-                except Exception as exc:
-                    status = f"Blocked move: {exc}"
-                last_key_time = now
-
-        current_pose = controller.current_pose()
-        draw_text(
-            screen,
-            font,
-            small_font,
-            controller.arm_id,
-            ARM_TASKS[controller.arm_id],
-            current_edit_name,
-            edit_pose,
-            current_pose,
-            saved,
-            step_mm,
-            status,
+    lines: List[str] = []
+    for segment, values in summary.items():
+        if not values:
+            continue
+        avg = sum(values) / len(values)
+        lines.append(
+            f"{segment:<18} avg={avg:.3f}s  min={min(values):.3f}s  max={max(values):.3f}s  n={len(values)}"
         )
-        clock.tick(60)
-
-    save_points(points, points_path)
-    pygame.quit()
+    return lines or ["No timing runs yet. Press SPACE, H, or T to log motion times."]
 
 
-# Automatic movement loop after the points have been calibrated
-def run_mode(controller: TimedMeArm, points_path: str, cycles: int, log_path: str) -> None:
-    points = load_points(points_path)
-    arm_points = points[controller.arm_id]
 
-    rest = Pose(**arm_points["rest"])
-    intake = Pose(**arm_points["intake"])
-    outtake = Pose(**arm_points["outtake"])
-
-    sequence: List[Tuple[str, Pose]] = [
+def run_timing_sequence(driver: JointCalibrator, saved: Dict[str, Dict[str, float]], summary: Dict[str, List[float]],
+                        cycles: int = TIMING_TEST_CYCLES) -> str:
+    rest = clip_pose(as_pose(saved["rest"]))
+    intake = clip_pose(as_pose(saved["intake"]))
+    outtake = clip_pose(as_pose(saved["outtake"]))
+    sequence = [
         ("rest_to_intake", intake),
         ("intake_to_outtake", outtake),
         ("outtake_to_rest", rest),
     ]
 
-    print(f"\nRunning {controller.arm_id} | task: {ARM_TASKS[controller.arm_id]}")
-    print(f"Using points file: {points_path}")
-    print(f"Cycles: {cycles}\n")
-
-    home_info = controller.move_to(rest)
-    log_move_event(controller, home_info, cycle=0, segment="startup_to_rest", path=log_path)
-    print(f"Moved to REST first: {home_info['elapsed_s']:.3f}s")
-
-    summary: Dict[str, List[float]] = {name: [] for name, _ in sequence}
+    # Start from rest once.
+    start_pose = driver.last_pose or rest
+    elapsed = driver.apply_pose(rest)
+    log_joint_move("timing_start", 0, "startup_to_rest", start_pose, rest, elapsed)
 
     for cycle in range(1, cycles + 1):
-        print(f"Cycle {cycle}/{cycles}")
-        for segment_name, target_pose in sequence:
-            info = controller.move_to(target_pose)
-            summary[segment_name].append(float(info["elapsed_s"]))
-            log_move_event(controller, info, cycle=cycle, segment=segment_name, path=log_path)
+        current_start = rest
+        for segment_name, target in sequence:
+            elapsed = driver.apply_pose(target)
+            summary.setdefault(segment_name, []).append(elapsed)
+            log_joint_move("timing_test", cycle, segment_name, current_start, target, elapsed)
+            current_start = target
 
-            print(
-                f"  {segment_name:18s}  "
-                f"time={info['elapsed_s']:.3f}s  reached={int(info['reached'])}  "
-                f"end=({info['end_x']:.1f}, {info['end_y']:.1f}, {info['end_z']:.1f})"
-            )
-
-    print("\nTiming summary")
+    last_avg_parts = []
     for segment_name, values in summary.items():
-        avg = sum(values) / len(values) if values else 0.0
-        fastest = min(values) if values else 0.0
-        slowest = max(values) if values else 0.0
-        print(f"  {segment_name:18s} avg={avg:.3f}s  min={fastest:.3f}s  max={slowest:.3f}s")
-
-    print(f"\nSaved timing log to {log_path}\n")
-
-
-# Command-line setup
-def setup_logging() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(levelname)s | %(message)s",
-        datefmt="%H:%M:%S",
-    )
+        if values:
+            last_avg_parts.append(f"{segment_name} avg={sum(values)/len(values):.3f}s")
+    return "Timing test done | " + " | ".join(last_avg_parts[:3])
 
 
 
-def parse_cli_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Guided 3-arm meArm calibration + automation")
-    parser.add_argument(
-        "--arm-id",
-        default=ARM_ID,
-        choices=["arm1", "arm2", "arm3"],
-        help="Which arm this Pi is controlling",
-    )
-    parser.add_argument(
-        "--mode",
-        default="calibrate",
-        choices=["calibrate", "run"],
-        help="calibrate = keyboard setup, run = automatic timing run",
-    )
-    parser.add_argument(
-        "--cycles",
-        type=int,
-        default=3,
-        help="How many repeat cycles to run in automatic mode",
-    )
-    parser.add_argument(
-        "--address",
-        type=lambda x: int(x, 0),
-        default=DEFAULT_ADDRESS,
-        help="I2C address of the meArm controller, e.g. 0x6F",
-    )
-    parser.add_argument(
-        "--points-file",
-        default=POINTS_FILE,
-        help="JSON file for saved rest/intake/outtake points",
-    )
-    parser.add_argument(
-        "--log-file",
-        default=LOG_FILE,
-        help="CSV file for timing logs",
-    )
-    return parser.parse_args()
+def main():
+    if ARM_ID not in {"arm1", "arm2", "arm3"}:
+        raise ValueError("ARM_ID must be arm1, arm2, or arm3")
 
+    points = load_points(POINTS_FILE)
+    saved = points[ARM_ID]
+    selected_name = "rest"
+    edit_pose = clip_pose(as_pose(saved[selected_name]))
+    step_deg = DEFAULT_STEP_DEG
+    status = "Use direct joint control to set REST / INTAKE / OUTTAKE."
+    last_key_time = 0.0
+    timing_summary: Dict[str, List[float]] = {
+        "move_to_selected": [],
+        "move_to_rest": [],
+        "rest_to_intake": [],
+        "intake_to_outtake": [],
+        "outtake_to_rest": [],
+    }
 
+    driver = JointCalibrator(pwm_address=PWM_ADDRESS)
+    initial_elapsed = driver.apply_pose(edit_pose)
+    log_joint_move("startup", 0, "startup_pose", edit_pose, edit_pose, initial_elapsed)
 
-def main() -> int:
-    setup_logging()
-    args = parse_cli_args()
+    pygame.init()
+    screen = pygame.display.set_mode(WINDOW_SIZE)
+    pygame.display.set_caption(f"meArm Joint Calibration - {ARM_ID}")
+    clock = pygame.time.Clock()
+    font = pygame.font.SysFont(None, 30)
+    small_font = pygame.font.SysFont(None, 24)
 
-    controller = TimedMeArm(arm_id=args.arm_id, address=args.address)
-    stop_requested = False
+    running = True
+    try:
+        while running:
+            now = time.time()
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    running = False
+                elif event.type == pygame.KEYDOWN:
+                    if event.key in (pygame.K_ESCAPE, pygame.K_q):
+                        running = False
+                    elif event.key == pygame.K_1:
+                        selected_name = "rest"
+                        edit_pose = clip_pose(as_pose(saved[selected_name]))
+                        status = "Editing REST"
+                    elif event.key == pygame.K_2:
+                        selected_name = "intake"
+                        edit_pose = clip_pose(as_pose(saved[selected_name]))
+                        status = "Editing INTAKE"
+                    elif event.key == pygame.K_3:
+                        selected_name = "outtake"
+                        edit_pose = clip_pose(as_pose(saved[selected_name]))
+                        status = "Editing OUTTAKE"
+                    elif event.key == pygame.K_RETURN:
+                        saved[selected_name] = asdict(edit_pose)
+                        save_points(points, POINTS_FILE)
+                        status = f"Saved {selected_name.upper()}"
+                    elif event.key == pygame.K_SPACE:
+                        start_pose = driver.last_pose or edit_pose
+                        edit_pose = clip_pose(as_pose(saved[selected_name]))
+                        elapsed = driver.apply_pose(edit_pose)
+                        timing_summary["move_to_selected"].append(elapsed)
+                        log_joint_move("saved_move", 0, f"to_{selected_name}", start_pose, edit_pose, elapsed)
+                        status = f"Moved to saved {selected_name.upper()} | time={elapsed:.3f}s"
+                    elif event.key == pygame.K_h:
+                        start_pose = driver.last_pose or edit_pose
+                        edit_pose = clip_pose(as_pose(saved["rest"]))
+                        elapsed = driver.apply_pose(edit_pose)
+                        timing_summary["move_to_rest"].append(elapsed)
+                        log_joint_move("saved_move", 0, "to_rest", start_pose, edit_pose, elapsed)
+                        status = f"Moved to REST | time={elapsed:.3f}s"
+                    elif event.key == pygame.K_t:
+                        status = run_timing_sequence(driver, saved, timing_summary, TIMING_TEST_CYCLES)
+                        edit_pose = clip_pose(as_pose(saved["rest"]))
+                    elif event.key == pygame.K_LEFTBRACKET:
+                        step_deg = max(MIN_STEP_DEG, step_deg - 0.5)
+                        status = f"Step size = {step_deg:.1f} degrees"
+                    elif event.key == pygame.K_RIGHTBRACKET:
+                        step_deg = min(MAX_STEP_DEG, step_deg + 0.5)
+                        status = f"Step size = {step_deg:.1f} degrees"
 
-    def _handle_stop(signum, frame):
-        nonlocal stop_requested
-        stop_requested = True
-        try:
-            points = load_points(args.points_file)
-            rest = Pose(**points[args.arm_id]["rest"])
-            controller.move_to(rest)
-        except Exception:
-            pass
-        finally:
-            sys.exit(0)
+            if now - last_key_time >= KEY_INTERVAL_S:
+                keys = pygame.key.get_pressed()
+                moved = False
+                new_pose = JointPose(edit_pose.base, edit_pose.shoulder, edit_pose.elbow)
 
-    signal.signal(signal.SIGINT, _handle_stop)
-    signal.signal(signal.SIGTERM, _handle_stop)
+                if keys[pygame.K_UP]:
+                    new_pose.base += step_deg
+                    moved = True
+                elif keys[pygame.K_DOWN]:
+                    new_pose.base -= step_deg
+                    moved = True
+                elif keys[pygame.K_RIGHT]:
+                    new_pose.shoulder += step_deg
+                    moved = True
+                elif keys[pygame.K_LEFT]:
+                    new_pose.shoulder -= step_deg
+                    moved = True
+                elif keys[pygame.K_a]:
+                    new_pose.elbow += step_deg
+                    moved = True
+                elif keys[pygame.K_s]:
+                    new_pose.elbow -= step_deg
+                    moved = True
 
-    if args.mode == "calibrate":
-        calibration_mode(controller, args.points_file, args.log_file)
-    elif args.mode == "run":
-        run_mode(controller, args.points_file, args.cycles, args.log_file)
+                if moved:
+                    edit_pose = clip_pose(new_pose)
+                    start_pose = driver.last_pose or edit_pose
+                    elapsed = driver.apply_pose(edit_pose, settle_s=PREVIEW_SETTLE_S)
+                    log_joint_move("preview", 0, selected_name, start_pose, edit_pose, elapsed)
+                    status = f"Previewing {selected_name.upper()} | time={elapsed:.3f}s"
+                    last_key_time = now
 
-    if not stop_requested:
-        print("Done.")
-    return 0
+            timing_lines = format_timing_lines(timing_summary)
+            draw_text(screen, font, small_font, selected_name, edit_pose, saved, step_deg, status, timing_lines)
+            clock.tick(60)
+    finally:
+        save_points(points, POINTS_FILE)
+        pygame.quit()
+        driver.release()
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()

@@ -4,7 +4,7 @@ from Adafruit_MotorHAT import Adafruit_MotorHAT, Adafruit_DCMotor
 import time
 
 # Initialise the PCA9685 using the default address (0x60) or (0x6F).
-mh = Adafruit_MotorHAT(addr=0x70, i2c_bus=1) 
+mh = Adafruit_MotorHAT(addr=0x60, i2c_bus=1) 
 
 # Helper function to make setting a servo pulse width simpler.
 # Pulse is in microseconds
