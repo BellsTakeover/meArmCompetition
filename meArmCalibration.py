@@ -37,8 +37,8 @@ Files created:
 
 User guide (Megan + Wayne):
 1. In Thonny, set ARM_ID near the top of this file to arm1, arm2, or arm3 (what we decided on)
-2. Leave MODE = "calibrate" and press Run to save the 3 positions
-3. Change MODE = "run" and change CYCLES = 5, then press Run again.
+2. Push RUN and the GUI that chatgpt created should run you through the processes
+3. After you finish calibrating press 'T' to run the time check
 4. Send to Isabella (copy and paste into an email works just make sure to ):
    - mearm_joint_points.json
    - mearm_joint_move_log.csv
@@ -70,7 +70,7 @@ MAX_STEP_DEG = 10.0
 KEY_INTERVAL_S = 0.06
 MOVE_SETTLE_S = 0.18
 PREVIEW_SETTLE_S = 0.04
-TIMING_TEST_CYCLES = 3
+TIMING_TEST_CYCLES = 3 # change if I want more timing cycle
 
 # Servo channels used by the meArm files shared in this conversation.
 CHANNELS = {
