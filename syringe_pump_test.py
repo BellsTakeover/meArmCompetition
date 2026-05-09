@@ -52,7 +52,7 @@ class SyringePumpMotorKit:
         normal_step_delay_s=0.0010, #slower=0.0015, fast = 0.001
         burst_step_delay_s=0.0002, #fastest=0.0002, slower=0.001
     ):
-        self.kit = MotorKit(i2c=board.I2C())
+        self.kit = MotorKit(i2c=board.I2C(), address=0x60) #change if needed
 
         if stepper_num == 1:
             self.stepper = self.kit.stepper1

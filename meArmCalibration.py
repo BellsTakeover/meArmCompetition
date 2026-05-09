@@ -67,9 +67,9 @@ WINDOW_SIZE = (780, 540)
 DEFAULT_STEP_DEG = 2.0
 MIN_STEP_DEG = 0.5
 MAX_STEP_DEG = 10.0
-KEY_INTERVAL_S = 0.06
-MOVE_SETTLE_S = 0.18
-PREVIEW_SETTLE_S = 0.04
+KEY_INTERVAL_S = 3
+MOVE_SETTLE_S = 3
+PREVIEW_SETTLE_S = 3
 TIMING_TEST_CYCLES = 3 # change if I want more timing cycle
 
 # Servo channels used by the meArm files shared in this conversation.
